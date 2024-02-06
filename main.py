@@ -26,6 +26,7 @@ from prune.rescale import rescale_mask
 from evaluate.nlp import test_accuracy
 from utils.schedule import get_pruning_schedule
 
+from prune.kcm import search_mac_kcm, collect_importance
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,21 @@ parser.add_argument("--mha_lut", type=str, default=None)
 parser.add_argument("--ffn_lut", type=str, default=None)
 parser.add_argument("--num_samples", type=int, default=2048)
 parser.add_argument("--seed", type=int, default=0)
+parser.add_argument("--sigma", type=float, default=1.0, 
+    help="The width of Gaussian kernel",
+)
+parser.add_argument("--alpha", type=float, default=0.01,
+    help="The convergence rate of KCM",
+)
+parser.add_argument("--d2_norm", type=str, default="z-score", choices=[
+    "z-score",
+    "maxmin",
+    "l2",
+    "log",
+])
+parser.add_argument("--r", type=float, default=0.75, 
+    help="The low rank dimension of fatorized ffn2 matrix",
+)
 
 
 def main():
@@ -148,27 +164,44 @@ def main():
 
     start = time.time()
     # Search the optimal mask
-    head_grads, neuron_grads = collect_mask_grads(
-        model,
-        full_head_mask,
-        full_neuron_mask,
-        sample_dataloader,
-    )
+    head_importance, neuron_importance = collect_importance(model, args, sample_dataloader)
+    # head_grads, neuron_grads = collect_mask_grads(
+    #     model,
+    #     full_head_mask,
+    #     full_neuron_mask,
+    #     sample_dataloader,
+    # )
     teacher_constraint = get_pruning_schedule(target=args.constraint, num_iter=2)[0]
     if args.metric == "mac":
-        teacher_head_mask, teacher_neuron_mask = search_mac(
+        # teacher_head_mask, teacher_neuron_mask = search_mac(
+        #     config,
+        #     head_grads,
+        #     neuron_importance,
+        #     seq_len,
+        #     teacher_constraint,
+        # )
+        # head_mask, neuron_mask = search_mac(
+        #     config,
+        #     head_grads,
+        #     neuron_importance,
+        #     seq_len,
+        #     args.constraint,
+        # )
+        # pruned_mac, orig_mac = compute_mask_mac(head_mask, neuron_mask, seq_len, config.hidden_size)
+        teacher_head_mask, teacher_neuron_mask = search_mac_kcm(
             config,
-            head_grads,
-            neuron_grads,
+            head_importance,
+            neuron_importance,
             seq_len,
             teacher_constraint,
         )
-        head_mask, neuron_mask = search_mac(
+        head_mask, neuron_mask = search_mac_kcm(
             config,
-            head_grads,
-            neuron_grads,
+            head_importance,
+            neuron_importance,
             seq_len,
             args.constraint,
+            True,
         )
         pruned_mac, orig_mac = compute_mask_mac(head_mask, neuron_mask, seq_len, config.hidden_size)
         logger.info(f"Pruned Model MAC: {pruned_mac / orig_mac * 100.0:.2f} %")
@@ -195,8 +228,8 @@ def main():
         logger.info(f"Pruned Model Latency: {pruned_latency:.2f} ms")
 
     # Rearrange the mask
-    head_mask = rearrange_mask(head_mask, head_grads)
-    neuron_mask = rearrange_mask(neuron_mask, neuron_grads)
+    # head_mask = rearrange_mask(head_mask, head_grads)
+    # neuron_mask = rearrange_mask(neuron_mask, neuron_grads)
 
     # Rescale the mask by solving a least squares problem
     head_mask, neuron_mask = rescale_mask(
