@@ -66,7 +66,7 @@ parser.add_argument("--alpha", type=float, default=0.01,
 )
 parser.add_argument("--d2_norm", type=str, default="z-score", choices=[
     "z-score",
-    "maxmin",
+    "minmax",
     "l2",
     "log",
 ])
@@ -106,7 +106,7 @@ def main():
     logger.info(args)
 
     # Set a GPU and the experiment seed
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+    # os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     set_seed(args.seed)
     logger.info(f"Seed number: {args.seed}")
 
@@ -201,8 +201,10 @@ def main():
             neuron_importance,
             seq_len,
             args.constraint,
-            True,
+            log=True,
         )
+        # teacher_head_mask = full_head_mask
+        # head_mask = full_head_mask
         pruned_mac, orig_mac = compute_mask_mac(head_mask, neuron_mask, seq_len, config.hidden_size)
         logger.info(f"Pruned Model MAC: {pruned_mac / orig_mac * 100.0:.2f} %")
     elif args.metric == "latency":
@@ -242,7 +244,7 @@ def main():
         sample_dataloader,
         classification_task=not IS_SQUAD,
     )
-
+    # head_mask = full_head_mask
     # Print the pruning time
     end = time.time()
     logger.info(f"{args.task_name} Pruning time (s): {end - start}")
