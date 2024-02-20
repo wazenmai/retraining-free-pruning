@@ -1,6 +1,9 @@
 """ Implement Gradient-Free Structured Pruning with Unlabeled Data Algorithm """
 
 import torch
+import torch.nn.functional as F
+from torch.nn import MSELoss, CrossEntropyLoss
+
 from utils.arch import get_ffn2, get_mha_proj
 from efficiency.mac import compute_mac, mac_per_head, mac_per_neuron
 
@@ -42,6 +45,14 @@ def hijack(module, _list, _hijack_input, _stop_forward=False):
         handle = module.register_forward_hook(output_hook)
     return handle
 
+def apply_mask(module, _mask):
+    # applying masks to the input to compute gradients
+    def masking(_, i):
+        return _mask * i[0]
+
+    handle = module.register_forward_pre_hook(masking)
+    return handle
+
 @torch.no_grad()
 def search_mac_kcm(
     config,
@@ -49,6 +60,7 @@ def search_mac_kcm(
     neuron_importance,
     seq_len,
     mac_constraint,
+    logger=None,
     log=False,
 ):
     assert mac_constraint < 1
@@ -93,10 +105,10 @@ def search_mac_kcm(
     head_mask = head_mask.view(num_hidden_layers, num_attention_heads)
 
     # only prune neuron
-    heads_mac = mac_per_head(seq_len, hidden_size, attention_head_size) * num_attention_heads * num_hidden_layers
-    neurons_mac = max_mac - heads_mac
-    num_neurons = int(neurons_mac / mac_per_neuron(seq_len, hidden_size))
-    neuron_indicies = sorted_neuron_indicies[:num_neurons]
+    # heads_mac = mac_per_head(seq_len, hidden_size, attention_head_size) * num_attention_heads * num_hidden_layers
+    # neurons_mac = max_mac - heads_mac
+    # num_neurons = int(neurons_mac / mac_per_neuron(seq_len, hidden_size))
+    # neuron_indicies = sorted_neuron_indicies[:num_neurons]
 
     neuron_mask = torch.zeros(num_hidden_layers * intermediate_size).cuda()
     neuron_mask[neuron_indicies] = 1.0
@@ -107,17 +119,16 @@ def search_mac_kcm(
             # count how many zeros in head_mask[i]
             pruned_heads = (head_mask[i] == 0).nonzero()
             pruned_neurons = (neuron_mask[i] == 0).nonzero()
-            if pruned_heads.size(0) > 0:
-                print("layer {} prune {} heads: {}".format(i, pruned_heads.size(0), pruned_heads.squeeze().tolist()), end="")
+            if pruned_heads.size(1) > 0:
+                logger.info("layer {} prune {} heads: {}, {} neurons".format(i, pruned_heads.size(0), pruned_heads.squeeze().tolist(), pruned_neurons.size(0)))
             else:
-                print("layer {} prune 0 heads".format(i), end="")
-            print(", {} neurons".format(pruned_neurons.size(0)))
+                logger.info("layer {} prune 0 heads, {} neurons".format(i, pruned_neurons.size(0)))
 
     return head_mask, neuron_mask
 
 def d2_importance(model, type, structure, dataloader, log=False):
     """
-    a function to compute d2 importance based on ffn activated output of neurons
+    a function to compute d2 importance based on ffn activated output of neurons or heads before mha output projection
 
     * Inputs
         - model: the target model to compress
@@ -163,6 +174,7 @@ def d2_importance(model, type, structure, dataloader, log=False):
         outputs = model(**batch)
 
         for idx in range(num_layers):
+            # _features = torch.abs(_inputs[idx][-1])
             _features = _inputs[idx][-1]
             # abs
             # d2 = torch.mean(_features, dim=(0, 1))
@@ -207,41 +219,57 @@ def d2_importance(model, type, structure, dataloader, log=False):
 
     return standardized_importance
 
-def r2_neuron_importance(model, sigma, alpha, r, dataloader, log=False):
+def r2_importance(model, sigma, alpha, r, structure, dataloader, log=False):
     """
-    a function to compute r2 importance based on approximated convex hull of ffn2
+    a function to compute r2 importance based on approximated convex hull of ffn2 or output_mha
 
     * Inputs
         - model: the target model to compress
         - sigma: width of the gaussian kernel
         - alpha: convergence rate of KCM
         - r: the rank of factorization
+        - structure: type of structure, choices = ["N" means neurons, "H" means attention heads]
         - dataloader: dataloader for unlabeled data
     * Outputs
         - neuron_importance: importance of neurons, (layers x ffn dimension)
     """
     num_layers = model.config.num_hidden_layers
-    ffn_dim = model.config.intermediate_size
+    num_attention_heads = model.config.num_attention_heads
+    attention_head_size = int(model.config.hidden_size / num_attention_heads)
     hidden_size = model.config.hidden_size
-    neuron_importance = torch.zeros(num_layers, ffn_dim).cuda()
+    ffn_dim = model.config.intermediate_size
+    if structure == "N":
+        importance = torch.zeros(num_layers, ffn_dim).cuda()
+    else:
+        importance = torch.zeros(num_layers, hidden_size).cuda()
+        head_importance = torch.zeros(num_layers, num_attention_heads).cuda()
 
     r = torch.tensor(r * hidden_size, dtype=torch.long)
 
     for l in range(num_layers):
-        weight = get_ffn2(model, l).dense.weight
+        if structure == "N":
+            weight = get_ffn2(model, l).dense.weight
+        else:
+            weight = get_mha_proj(model, l).dense.weight
         # U, S, Vh = torch.linalg.svd(weight.T, full_matrices=False)
         # Ur = U[:, :r]
         # Sr = S[:r]
         # Vhr = Vh[:r, :]
         # new_weight = torch.matmul(Ur, Sr)
-        c = torch.ones(ffn_dim, ffn_dim).cuda() * (1 / ffn_dim)
+        if structure == "N":
+            c = torch.ones(ffn_dim, ffn_dim).cuda() * (1 / ffn_dim)
+        else:
+            c = torch.ones(hidden_size, hidden_size).cuda() * (1 / hidden_size)
         # k = gaussian_kernel(new_weight, new_weight, sigma)
         k = gaussian_kernel(weight.T, weight.T, sigma)
         i = 0
         while True:
             # k(i, j): gaussian kernel of x_i and x_j
             # k(i): gaussian kernel of x_i with X
-            next_c = torch.zeros(ffn_dim, ffn_dim).cuda()
+            if structure == "N":
+                next_c = torch.zeros(ffn_dim, ffn_dim).cuda()
+            else:
+                next_c = torch.zeros(hidden_size, hidden_size).cuda()
             update = torch.sqrt(k / torch.matmul(k, c))
             next_c = c * update
             
@@ -252,13 +280,151 @@ def r2_neuron_importance(model, sigma, alpha, r, dataloader, log=False):
                 break
             i += 1
         # r2_importance = diagnoal of c
-        neuron_importance[l] = torch.diag(c)
-    maxs = torch.max(neuron_importance, dim=1, keepdim=True)[0]
-    mins = torch.min(neuron_importance, dim=1, keepdim=True)[0]
-    standardized_importance = (neuron_importance - mins) / (maxs - mins) 
+        importance[l] = torch.diag(c)
+        if structure == "H":
+            for i in range(num_attention_heads):
+                head_importance[l, i] = torch.sum(importance[l, i * attention_head_size: (i+1) * attention_head_size]) / attention_head_size
+    
+    if structure == "H":
+        importance = head_importance
+
+    maxs = torch.max(importance, dim=1, keepdim=True)[0]
+    mins = torch.min(importance, dim=1, keepdim=True)[0]
+    standardized_importance = (importance - mins) / (maxs - mins) 
     if log:
-        print("neuron r2-importance {} {}".format(standardized_importance.shape, standardized_importance[:, :5]))
+        print("r2-importance of structure {}: {} {}".format(structure, standardized_importance.shape, standardized_importance[:, :5]))
     return standardized_importance
+
+def predictive_importance(model, T, dataloader, log=False):
+    """
+    a function to compute predictive importance based on the output of the model
+
+    * Inputs
+        - model: the target model to compress
+        - T: the temperature of softmax function
+        - dataloader: dataloader for unlabeled data
+    * Outputs
+        - importance: importance of neurons (layers x ffn dimension) or of heads (layers x attention head)
+    """
+    # (1) Initialization
+    model.eval()
+
+    num_layers = model.config.num_hidden_layers
+    num_heads = model.config.num_attention_heads
+    hidden_size = model.config.hidden_size
+    ffn_dim = model.config.intermediate_size
+    head_dim = hidden_size // num_heads
+
+    head_label_ks = torch.zeros(num_layers, num_heads).cuda()
+    neuron_label_ks = torch.zeros(num_layers, ffn_dim).cuda()
+
+    # tensors for compute gradients of masks
+    _head_masks = torch.ones(num_layers, num_heads * head_dim).cuda()  # 12 x 768
+    _neuron_masks = torch.ones(num_layers, ffn_dim).cuda()  # 12 x 3072
+    _head_masks.requires_grad_(True)
+    _neuron_masks.requires_grad_(True)
+
+    kd_labels = []
+
+    # 先當是 neuron 的 prediction importance
+
+    # (2) Register hook function
+    hanels = []
+    for l in range(num_layers):
+        neuron_output_proj = get_ffn2(model, l).dense
+        neuron_layer_mask = _neuron_masks[l]
+        head_output_proj = get_mha_proj(model, l).dense
+        head_layer_mask = _head_masks[l]
+        hanels.append(
+            apply_mask(neuron_output_proj, neuron_layer_mask)
+        )
+        hanels.append(
+            apply_mask(head_output_proj, head_layer_mask)
+        )
+    
+    # (3) Do forward and measure knowledge
+    num_tokens = 0
+    num_samples = 0
+    _bc = 0
+    _index = 0
+    for batch in dataloader:
+        for k, v in batch.items():
+            batch[k] = v.to("cuda", non_blocking=True)
+        
+        att_mask = batch["attention_mask"].bool()
+        num_tokens += batch["attention_mask"].sum()
+        batch_samples = batch["attention_mask"].shape[0]
+        labels = batch["labels"]
+        num_samples += batch_samples
+
+        outputs = model(**batch)
+
+        # GLUE
+        if model.config.problem_type == "regression":
+            loss_fct = MSELoss()
+            # if model.num_labels == 1:
+            #     pred = outputs.logits.squeeze().detach()
+            # else:
+            #     pred = outputs.logits.detach()
+            loss = loss_fct(outputs.logits, labels)
+            loss.backward()
+        else: # single label classification
+            # Compute KL divergence for measuring the amount of predicitive knowledge
+            
+            # pred = F.softmax(outputs.logits / T, dim=1)
+            # print("pred: {} {}".format(pred.shape, pred[:5]))
+            # kl_div = F.kl_div(
+            #     input=F.log_softmax(outputs.logits / T, dim=1),
+            #     target=pred,
+            #     reduction="batchmean"
+            # ) * (T ** 2)
+            # kl_div.backward()
+
+            # Use ground truth 
+            pred = outputs.logits
+            loss_fct = CrossEntropyLoss()
+            # print("pred: {} {}".format(pred.shape, pred))
+            # print("labels: {} {}".format(labels.shape, labels))
+            loss = loss_fct(pred, labels)
+            # print("loss: {}".format(loss))
+            loss.backward()
+        
+        # print("head_masks: {} {}".format(_head_masks.grad.shape, _head_masks.grad[:5, :5]))
+
+        for l in range(num_layers):
+            layer_grad = _neuron_masks.grad[l]
+            neuron_label_ks[l] += (layer_grad.detach() ** 2) * 0.5
+
+            layer_grad = _head_masks.grad[l]
+            _label_score = ((layer_grad.detach() ** 2) * 0.5) \
+                    .view(-1, head_dim).mean(dim=1)
+            head_label_ks[l] += (_label_score)
+        _neuron_masks.grad.zero_()
+        _head_masks.grad.zero_()
+
+    
+    # (4) Finish
+    # Average the importance
+    head_label_ks = head_label_ks / num_samples
+    neuron_label_ks = neuron_label_ks / num_samples
+
+    head_label_ks = head_label_ks
+
+    # Minmax normalization
+    maxs = torch.max(neuron_label_ks, dim=1, keepdim=True)[0]
+    mins = torch.min(neuron_label_ks, dim=1, keepdim=True)[0]
+    neuron_label_ks = (neuron_label_ks - mins) / (maxs - mins)
+
+    maxs = torch.max(head_label_ks, dim=1, keepdim=True)[0]
+    mins = torch.min(head_label_ks, dim=1, keepdim=True)[0]
+    head_label_ks = (head_label_ks - mins) / (maxs - mins)
+
+    if log:
+        print("head_label_ks: {} {}".format(head_label_ks.shape, head_label_ks[:5, :5]))
+        print("neuron_label_ks: {} {}".format(neuron_label_ks.shape, neuron_label_ks[:5, :5]))
+
+    return head_label_ks, neuron_label_ks
+
 
 # gaussian kernel function
 def gaussian_kernel(x, y, sigma):
@@ -298,65 +464,24 @@ def gaussian_kernel(x, y, sigma):
     # e = torch.exp(torch.div((torch.add(torch.pow(x, 2), torch.pow(y, 2))), 2 * (sigma ** 2)))
     # return torch.mul(constant, e)
 
-def r2_head_importance(model, sigma, alpha, dataloader, log=False):
-    """
-    a function to compute r2 importance based on approximated convex hull of ffn2
+def collect_importance(model, args, full_head_mask, full_neuron_mask, sample_dataloader):
+    head_importance, neuron_importance = full_head_mask, full_neuron_mask
+    
+    if "d2" in args.importance:
+        head_d2_importance = d2_importance(model, args.d2_norm, "H", sample_dataloader, log=True)
+        neuron_d2_importance = d2_importance(model, args.d2_norm, "N", sample_dataloader, log=True)
+        head_importance *= head_d2_importance
+        neuron_importance *= neuron_d2_importance
+    if "r2" in args.importance:
+        head_r2_importance = r2_importance(model, args.sigma, args.alpha, args.r, "H", sample_dataloader, log=True)
+        neuron_r2_importance = r2_importance(model, args.sigma, args.alpha, args.r, "N", sample_dataloader, log=True)
+        head_importance *= head_r2_importance
+        neuron_importance *= neuron_r2_importance
+    if "predict" in args.importance:
+        head_predict_importance, neuron_predict_importance = predictive_importance(model, args.T, sample_dataloader, log=True)
+        head_importance *= head_predict_importance * args.mu
+        neuron_importance *= neuron_predict_importance
 
-    * Inputs
-        - model: the target model to compress
-        - sigma: width of the gaussian kernel
-        - alpha: convergence rate of KCM
-        - dataloader: dataloader for unlabeled data
-    * Outputs
-        - head_importance: importance of heads, (layers x attention head)
-    """
-    num_layers = model.config.num_hidden_layers
-    num_attention_heads = model.config.num_attention_heads
-    attention_head_size = int(model.config.hidden_size / num_attention_heads)
-    hidden_size = model.config.hidden_size
-    importance = torch.zeros(num_layers, hidden_size).cuda()
-    head_importance = torch.zeros(num_layers, num_attention_heads).cuda()
-
-    for l in range(num_layers):
-        weight = get_mha_proj(model, l).dense.weight
-        c = torch.ones(hidden_size, hidden_size).cuda() * (1 / hidden_size)
-        k = gaussian_kernel(weight.T, weight.T, sigma)
-        # print("layer {}, c = {}".format(l, c.shape))
-        i = 0
-        while True:
-            # k(i, j): gaussian kernel of x_i and x_j
-            # k(i): gaussian kernel of x_i with X
-            next_c = torch.zeros(hidden_size, hidden_size).cuda()
-            update = torch.sqrt(k / torch.matmul(k, c))
-            next_c = c * update
-            
-            diff = torch.abs(torch.sum(next_c - c) / torch.sum(torch.abs(c)))
-            # print("iter {} diff: {}, c: {}, next_c: {}, update: {}".format(i, diff, c[0, :5], next_c[0, :5], update[0, :5]))
-            c = next_c
-            if diff < alpha:
-                break
-            i += 1
-        # r2_importance = diagnoal of c
-        importance[l] = torch.diag(c)
-        for i in range(num_attention_heads):
-            head_importance[l, i] = torch.sum(importance[l, i * attention_head_size: (i+1) * attention_head_size]) / attention_head_size
-        
-       
-    maxs = torch.max(head_importance, dim=1, keepdim=True)[0]
-    mins = torch.min(head_importance, dim=1, keepdim=True)[0]
-    standardized_importance = (head_importance - mins) / (maxs - mins)
-
-    if log:
-        print("head r2-importance {} {}".format(head_importance.shape, head_importance[:, :5])) 
-    return standardized_importance
-
-def collect_importance(model, args, sample_dataloader):
-    head_d2_importance = d2_importance(model, args.d2_norm, "H", sample_dataloader, log=True)
-    head_r2_importance = r2_head_importance(model, args.sigma, args.alpha, sample_dataloader, log=True)
-    neuron_d2_importance = d2_importance(model, args.d2_norm, "N", sample_dataloader, log=True)
-    neuron_r2_importance = r2_neuron_importance(model, args.sigma, args.alpha, args.r, sample_dataloader, log=True)
-    neuron_importance = neuron_d2_importance * neuron_r2_importance
-    head_importance = head_d2_importance * head_r2_importance
     return head_importance, neuron_importance
 
 def rescale_mask_kcm(

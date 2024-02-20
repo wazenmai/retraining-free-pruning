@@ -1,6 +1,12 @@
+TASK=sst2
+CONSTRAINT=0.7
+IMPORTANCE=r2
+NAME=prune_all_$IMPORTANCE
+
 python3 main.py --model_name bert-base-uncased \
-                --task_name mrpc \
-                --ckpt_dir ckpts/bert-base-uncased/mrpc \
-                --constraint 0.7 \
+                --task_name $TASK \
+                --ckpt_dir ckpts/bert-base-uncased/$TASK \
+                --constraint $CONSTRAINT \
                 --seed 0 \
-                --output my_outputs/bert-base-uncased/mrpc/mac/0.7/prune_all_d2_stand_squared \
+                --importance $IMPORTANCE \
+                --output my_outputs/bert-base-uncased/$TASK/mac/$CONSTRAINT/$NAME \

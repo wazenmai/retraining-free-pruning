@@ -73,6 +73,11 @@ parser.add_argument("--d2_norm", type=str, default="z-score", choices=[
 parser.add_argument("--r", type=float, default=0.75, 
     help="The low rank dimension of fatorized ffn2 matrix",
 )
+parser.add_argument("--importance", type=str, default="r2+d2+predict")
+parser.add_argument("--T", type=float, default=2.,
+                    help='a temperature for softmax functions')
+parser.add_argument("--mu", type=float, default=64.,
+                    help='weight for head importance score')
 
 
 def main():
@@ -164,7 +169,7 @@ def main():
 
     start = time.time()
     # Search the optimal mask
-    head_importance, neuron_importance = collect_importance(model, args, sample_dataloader)
+    head_importance, neuron_importance = collect_importance(model, args, full_head_mask, full_neuron_mask, sample_dataloader)
     # head_grads, neuron_grads = collect_mask_grads(
     #     model,
     #     full_head_mask,
@@ -201,6 +206,7 @@ def main():
             neuron_importance,
             seq_len,
             args.constraint,
+            logger=logger,
             log=True,
         )
         # teacher_head_mask = full_head_mask
